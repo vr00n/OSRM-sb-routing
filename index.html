@@ -1,0 +1,891 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>School Bus Route Optimizer (OSRM) - Advanced Map</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/papaparse@5.3.0/papaparse.min.js"></script>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+     integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+     crossorigin=""/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+     integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+     crossorigin=""></script>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .table-fixed-layout { table-layout: fixed; width: 100%; }
+        .table-fixed-layout th, .table-fixed-layout td { overflow-wrap: break-word; word-wrap: break-word; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 10px; }
+        ::-webkit-scrollbar-thumb { background: #888; border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: #555; }
+        .loader {
+            border: 5px solid #f3f3f3; border-top: 5px solid #3498db;
+            border-radius: 50%; width: 50px; height: 50px;
+            animation: spin 1s linear infinite; margin: 20px auto;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .pulsing-loader { display: inline-block; animation: pulse 1.5s infinite ease-in-out; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        
+        .map-modal-overlay {
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background-color: rgba(0, 0, 0, 0.75); display: flex; 
+            align-items: center; justify-content: center;
+            z-index: 1000; padding: 1rem;
+        }
+        .map-modal-content {
+            background-color: white; padding: 20px; border-radius: 8px;
+            width: 90%; height: 90%; max-width: 1200px; max-height: 800px; 
+            display: flex; flex-direction: column; box-shadow: 0 0 20px rgba(0,0,0,0.2);
+        }
+        #map-container { height: 100%; width: 100%; border-radius: 4px; }
+        .map-modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;}
+        .map-modal-title { font-size: 1.25rem; font-weight: 600; }
+        .map-modal-controls { display: flex; justify-content: center; align-items: center; margin-bottom: 10px; gap: 15px; }
+        .map-modal-controls label { margin-right: 5px; font-size: 0.9rem; }
+        .map-modal-controls input[type="radio"] { margin-right: 3px; }
+
+        .map-modal-subtitle { font-size: 0.8rem; color: #f97316; margin-bottom:10px; text-align: center; }
+        .map-modal-close-btn {
+            padding: 8px 12px; background-color: #ef4444; color: white;
+            border: none; border-radius: 6px; cursor: pointer; font-weight: 500;
+        }
+        .map-modal-close-btn:hover { background-color: #dc2626; }
+        .legend { padding: 6px 8px; font: 12px/14px Arial, Helvetica, sans-serif; background: white; background: rgba(255,255,255,0.8); box-shadow: 0 0 15px rgba(0,0,0,0.2); border-radius: 5px; }
+        .legend i { width: 18px; height: 18px; float: left; margin-right: 8px; opacity: 0.9; }
+        .map-loading-indicator {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            background-color: rgba(255, 255, 255, 0.8); padding: 10px 15px;
+            border-radius: 5px; box-shadow: 0 0 10px rgba(0,0,0,0.2);
+            z-index: 1001; 
+        }
+
+        .custom-div-icon {
+            background-color: #3498db; 
+            color: white; border-radius: 50%;
+            width: 28px; height: 28px; display: flex;
+            align-items: center; justify-content: center;
+            font-weight: bold; font-size: 13px;
+            border: 2px solid white; box-shadow: 0 0 6px rgba(0,0,0,0.6);
+            text-align: center; line-height: 24px; 
+        }
+        .custom-div-icon.school {
+            background-color: #e74c3c; font-size: 16px; 
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen flex items-center justify-center p-4">
+    <div id="root" class="w-full max-w-7xl"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useCallback, useRef } = React;
+
+        const OSRM_API_BASE = "https://router.project-osrm.org"; 
+        const MAX_OSRM_RETRIES = 1; 
+        const OSRM_RETRY_DELAY = 500; 
+
+        const routeGeometryCache = new Map();
+
+        async function retryAsync(fn, retriesLeft = MAX_OSRM_RETRIES, interval = OSRM_RETRY_DELAY, requestType = "N/A") {
+            try {
+                return await fn();
+            } catch (error) {
+                if (retriesLeft === 0) {
+                    console.error(`[OSRM Retry - ${requestType}] Max retries reached. Last error:`, error.message);
+                    throw error; 
+                }
+                console.warn(`[OSRM Retry - ${requestType}] Attempt failed. Retries left: ${retriesLeft}. Error: ${error.message}. Retrying in ${interval}ms...`);
+                await new Promise(resolve => setTimeout(resolve, interval));
+                return retryAsync(fn, retriesLeft - 1, interval, requestType);
+            }
+        }
+
+        async function getOSRMMatrix(points, routeIdentifier) {
+            const validPoints = points.filter(p => 
+                p && 
+                typeof p.lon === 'number' && !isNaN(p.lon) && 
+                typeof p.lat === 'number' && !isNaN(p.lat)
+            );
+
+            if (validPoints.length !== points.length) {
+                console.warn(`[OSRM Matrix Fetcher for ${routeIdentifier}]: Some points had invalid coordinates and were filtered out. Original: ${points.length}, Valid: ${validPoints.length}`);
+                points.filter(p => !(p && typeof p.lon === 'number' && !isNaN(p.lon) && typeof p.lat === 'number' && !isNaN(p.lat)))
+                    .forEach(invalidP => console.warn(`[OSRM Matrix Fetcher for ${routeIdentifier}]: Invalid point data for ID ${invalidP?.id}:`, invalidP));
+            }
+
+            if (validPoints.length < 2) {
+                return { durations: [], distances: [], map: new Map(), error: "Not enough valid coordinates for OSRM request.", pointsUsed: [] };
+            }
+
+            const coordinatesString = validPoints.map(p => `${p.lon},${p.lat}`).join(';');
+            // console.log(`[OSRM Matrix Fetcher for ${routeIdentifier}]: Coordinates string length: ${coordinatesString.length}, Number of valid points: ${validPoints.length}`);
+            const url = `${OSRM_API_BASE}/table/v1/driving/${coordinatesString}?annotations=duration,distance`;
+            
+            const fetchFunction = async () => {
+                const response = await fetch(url);
+                if (!response.ok) {
+                    const errorText = await response.text().catch(() => "Could not retrieve error text.");
+                    throw new Error(`OSRM API error ${response.status} (Table). Details: ${errorText}`);
+                }
+                const data = await response.json();
+                if (data.code !== "Ok") throw new Error(`OSRM API returned code ${data.code} (Table).`);
+                return data; 
+            };
+            try {
+                const data = await retryAsync(fetchFunction, MAX_OSRM_RETRIES, OSRM_RETRY_DELAY, `Matrix for ${routeIdentifier}`);
+                const pointMap = new Map();
+                validPoints.forEach((point, index) => pointMap.set(point.id, index));
+                return { durations: data.durations, distances: data.distances, map: pointMap, error: null, pointsUsed: validPoints };
+            } catch (error) {
+                let detailedErrorMessage = error.message || "Unknown fetch error (Table)";
+                 if (error.name === 'TypeError' && error.message.toLowerCase().includes('failed to fetch')) {
+                    detailedErrorMessage = "Failed to fetch OSRM matrix data. Check network/CSP.";
+                }
+                console.error(`[OSRM Matrix Fetcher for ${routeIdentifier}]: Final fetch error. Name: ${error.name}, Message: ${error.message}`);
+                return { durations: [], distances: [], map: new Map(), error: detailedErrorMessage, pointsUsed: [] };
+            }
+        }
+
+        async function getOSRMDrivingRouteGeometry(p1, p2, routeIdentifier, segmentIndex) {
+            if (!p1 || !p2 || typeof p1.lat !== 'number' || typeof p1.lon !== 'number' || typeof p2.lat !== 'number' || typeof p2.lon !== 'number') {
+                console.warn(`[OSRM Route Geometry for ${routeIdentifier}, Seg ${segmentIndex}]: Invalid coordinates for segment. P1:`,p1,"P2:",p2);
+                return null; 
+            }
+
+            const cacheKey = `${p1.lon},${p1.lat};${p2.lon},${p2.lat}`;
+            if (routeGeometryCache.has(cacheKey)) {
+                console.log(`[OSRM Route Geometry for ${routeIdentifier}, Seg ${segmentIndex}]: Returning cached geometry.`);
+                return routeGeometryCache.get(cacheKey);
+            }
+
+            const url = `${OSRM_API_BASE}/route/v1/driving/${p1.lon},${p1.lat};${p2.lon},${p2.lat}?overview=full&geometries=geojson`;
+            
+            const fetchFunction = async () => {
+                const response = await fetch(url);
+                if (!response.ok) {
+                    const errorText = await response.text().catch(() => "Could not retrieve error text.");
+                    throw new Error(`OSRM API error ${response.status} (Route Segment ${segmentIndex}). Details: ${errorText}`);
+                }
+                const data = await response.json();
+                if (data.code !== "Ok" || !data.routes || data.routes.length === 0) {
+                    throw new Error(`OSRM API returned code ${data.code} or no routes (Route Segment ${segmentIndex}).`);
+                }
+                return data.routes[0].geometry; 
+            };
+
+            try {
+                const geometry = await retryAsync(fetchFunction, MAX_OSRM_RETRIES, OSRM_RETRY_DELAY, `Route Segment ${segmentIndex} for ${routeIdentifier}`);
+                if (geometry) {
+                    routeGeometryCache.set(cacheKey, geometry); 
+                    console.log(`[OSRM Route Geometry for ${routeIdentifier}, Seg ${segmentIndex}]: Fetched and cached geometry.`);
+                }
+                return geometry;
+            } catch (error) {
+                 console.error(`[OSRM Route Geometry for ${routeIdentifier}, Seg ${segmentIndex}]: Final fetch error. Name: ${error.name}, Message: ${error.message}`);
+                return null; 
+            }
+        }
+        
+        function calculatePathMetricFromMatrix(pathPointIds, osrmData, metricType = 'durations') {
+            let totalMetric = 0;
+            if (!osrmData || !osrmData[metricType] || osrmData[metricType].length === 0 || !osrmData.map || pathPointIds.length < 2) {
+                return osrmData && osrmData.map ? 0 : Infinity; 
+            }
+            const matrix = osrmData[metricType];
+            const map = osrmData.map;
+            for (let i = 0; i < pathPointIds.length - 1; i++) {
+                const fromId = pathPointIds[i]; const toId = pathPointIds[i+1];
+                const fromIndex = map.get(fromId); const toIndex = map.get(toId);
+                if (fromIndex === undefined || toIndex === undefined) {
+                     console.warn(`[CALC PATH] Point ID not found in OSRM map during metric calculation. From: ${fromId} (idx: ${fromIndex}), To: ${toId} (idx: ${toIndex}). Check if these IDs were in 'osrmData.pointsUsed'.`);
+                    return Infinity; 
+                }
+                const segmentMetric = matrix[fromIndex]?.[toIndex];
+                if (segmentMetric === undefined || segmentMetric === null) return Infinity; 
+                totalMetric += segmentMetric;
+            }
+            return totalMetric;
+        }
+
+        function twoOptSolverOSRM(firstPupilPointId, pupilStopsToOptimize, osrmDataForPupilSegment, firstSchoolPointId) {
+            if (!pupilStopsToOptimize || pupilStopsToOptimize.length === 0) { 
+                 if (firstPupilPointId && firstSchoolPointId && osrmDataForPupilSegment.map.has(firstPupilPointId) && osrmDataForPupilSegment.map.has(firstSchoolPointId)) {
+                    const pIdx = osrmDataForPupilSegment.map.get(firstPupilPointId); const sIdx = osrmDataForPupilSegment.map.get(firstSchoolPointId);
+                    const duration = osrmDataForPupilSegment.durations[pIdx]?.[sIdx];
+                    return { optimizedOrder: [], duration: duration === undefined ? Infinity : duration }; 
+                } return { optimizedOrder: [], duration: 0 }; 
+            }
+            let currentBestOrder = [...pupilStopsToOptimize]; 
+            const getFullPathIdsForPupilSegment = (orderedOtherPupils) => {
+                const pathIds = [firstPupilPointId]; 
+                pathIds.push(...orderedOtherPupils.map(p => p.id)); 
+                if (firstSchoolPointId) pathIds.push(firstSchoolPointId); 
+                return pathIds;
+            };
+            let bestDuration = calculatePathMetricFromMatrix(getFullPathIdsForPupilSegment(currentBestOrder), osrmDataForPupilSegment, 'durations');
+            if (bestDuration === Infinity && pupilStopsToOptimize.length > 0) return { optimizedOrder: pupilStopsToOptimize, duration: Infinity };
+            let improved = true; let iterations = 0;
+            const MAX_ITERATIONS = currentBestOrder.length * Math.max(10, currentBestOrder.length); 
+            while (improved && iterations < MAX_ITERATIONS) {
+                improved = false; iterations++;
+                for (let i = 0; i < currentBestOrder.length - 1; i++) {
+                    for (let k = i + 1; k < currentBestOrder.length; k++) {
+                        const newOrder = [...currentBestOrder];
+                        const segmentToReverse = newOrder.slice(i, k + 1); segmentToReverse.reverse();
+                        newOrder.splice(i, k - i + 1, ...segmentToReverse);
+                        const currentDuration = calculatePathMetricFromMatrix(getFullPathIdsForPupilSegment(newOrder), osrmDataForPupilSegment, 'durations');
+                        if (currentDuration < bestDuration) { bestDuration = currentDuration; currentBestOrder = newOrder; improved = true; }
+                    }
+                }
+            }
+            return { optimizedOrder: currentBestOrder, duration: bestDuration };
+        }
+        
+        function validateData(data) {
+            if (!data || data.length === 0) {
+                return { isValid: false, message: "CSV data is empty or could not be parsed." };
+            }
+            if (typeof data[0] !== 'object' || data[0] === null) {
+                return { isValid: false, message: "CSV data format error: first row is not a valid object." };
+            }
+
+            let headers;
+            try {
+                headers = Object.keys(data[0]);
+            } catch (e) {
+                console.error("[VALIDATE DATA] Error getting headers from data[0]:", e);
+                return { isValid: false, message: `Error processing CSV headers: ${e.message}. Check console for details on the first data row.` };
+            }
+            
+            const requiredColumns = [ 'route_type', 'route', 'Seg_No', 'pupil_lat', 'pupil_lon', 'school_lat', 'school_lon', 'School_Code_&_Name', 'Sess_Beg.', 'Pupil_Id_No' ];
+            const missingColumns = requiredColumns.filter(col => !headers.includes(col));
+            
+            if (missingColumns.length > 0) {
+                const message = `Missing required CSV columns: ${missingColumns.join(', ')}. Please check your CSV file headers.`;
+                return { isValid: false, message: message };
+            }
+            return { isValid: true, message: "CSV data validated successfully." };
+        }
+
+        // MapModal Component
+        function MapModal({ show, onClose, mapData, routeId }) {
+            const mapRef = useRef(null); 
+            const mapContainerRef = useRef(null); 
+            const legendRef = useRef(null); 
+            const [isMapLoading, setIsMapLoading] = useState(false);
+            const [displayMode, setDisplayMode] = useState('both'); 
+            const drawnLayersRef = useRef([]); 
+
+            useEffect(() => {
+                let isMounted = true; 
+
+                const initializeAndDrawMap = async () => {
+                    if (!show || !mapData || !mapContainerRef.current) return;
+                    if(isMounted) setIsMapLoading(true);
+
+                    if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; }
+                    
+                    const map = L.map(mapContainerRef.current);
+                    mapRef.current = map;
+                    
+                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                    }).addTo(map);
+                    
+                    drawnLayersRef.current.forEach(layer => map.removeLayer(layer)); 
+                    drawnLayersRef.current = [];
+
+                    const bounds = L.latLngBounds();
+                    const addNumberedMarkers = (pathCoords, isOptimizedPath) => {
+                        if (!pathCoords) return;
+                        pathCoords.forEach((point) => {
+                            if (point && typeof point.lat === 'number' && !isNaN(point.lat) && typeof point.lon === 'number' && !isNaN(point.lon)) {
+                                const latLng = [point.lat, point.lon];
+                                bounds.extend(latLng);
+                                
+                                let iconHtml;
+                                let iconClassName = 'custom-div-icon';
+                                if (point.type === 'school') {
+                                    iconHtml = 'S';
+                                    iconClassName += ' school';
+                                } else {
+                                    iconHtml = point.sequenceInPath; 
+                                }
+
+                                const customIcon = L.divIcon({
+                                    html: `<div>${iconHtml}</div>`,
+                                    className: iconClassName,
+                                    iconSize: [28, 28],
+                                    iconAnchor: [14, 14] 
+                                });
+
+                                const markerLabel = `${point.label || `ID ${point.id}`}${point.type === 'school' ? ' (School)' : ` (Pupil Seq: ${point.sequenceInPath})`}`;
+                                const marker = L.marker(latLng, { icon: customIcon }).addTo(map).bindPopup(markerLabel);
+                                drawnLayersRef.current.push(marker);
+                            }
+                        });
+                    };
+                    
+                    const drawDrivingRoute = async (pathCoords, color) => {
+                        if (!pathCoords || pathCoords.length < 2) return;
+                        for (let i = 0; i < pathCoords.length - 1; i++) {
+                            if (!isMounted) return; 
+                            const p1 = pathCoords[i];
+                            const p2 = pathCoords[i+1];
+                            const geometry = await getOSRMDrivingRouteGeometry(p1, p2, routeId, i);
+                            if (geometry && isMounted) {
+                                const routeLayer = L.geoJSON(geometry, { style: { color: color, weight: 4, opacity: 0.7 } }).addTo(map);
+                                drawnLayersRef.current.push(routeLayer);
+                            } else if (isMounted) { 
+                                if (p1 && p2 && typeof p1.lat === 'number' && typeof p2.lat === 'number') {
+                                     const fallbackLayer = L.polyline([[p1.lat, p1.lon], [p2.lat, p2.lon]], { color: color, weight: 2, opacity: 0.5, dashArray: '5, 5' }).addTo(map);
+                                     drawnLayersRef.current.push(fallbackLayer);
+                                }
+                            }
+                        }
+                    };
+
+                    if (displayMode === 'original' || displayMode === 'both') {
+                        if (mapData.originalPathCoords) {
+                            addNumberedMarkers(mapData.originalPathCoords, false); 
+                            await drawDrivingRoute(mapData.originalPathCoords, 'blue');
+                        }
+                    }
+                    if (displayMode === 'optimized' || displayMode === 'both') {
+                         if (mapData.optimizedPathCoords) {
+                            addNumberedMarkers(mapData.optimizedPathCoords, true); 
+                            await drawDrivingRoute(mapData.optimizedPathCoords, 'green');
+                        }
+                    }
+
+                    if (!isMounted) return;
+
+                    setTimeout(() => {
+                        if (mapRef.current && isMounted) {
+                            if (bounds.isValid()) {
+                                mapRef.current.fitBounds(bounds, { padding: [50, 50] });
+                            } else if (mapData.originalPathCoords?.length > 0 && typeof mapData.originalPathCoords[0].lat === 'number') { 
+                                mapRef.current.setView([mapData.originalPathCoords[0].lat, mapData.originalPathCoords[0].lon], 13);
+                            } else {
+                                mapRef.current.setView([51.505, -0.09], 13); 
+                            }
+                            mapRef.current.invalidateSize();
+                        }
+                    }, 100); 
+
+                    if (legendRef.current) { legendRef.current.remove(); legendRef.current = null; }
+                    const legend = L.control({position: 'bottomright'});
+                    legend.onAdd = function (mapL) {
+                        const div = L.DomUtil.create('div', 'info legend');
+                        div.innerHTML =  '<h4>Route Legend</h4>' +
+                            ( (displayMode === 'original' || displayMode === 'both') ? '<i style="background: blue"></i> Original Route<br>' : '') +
+                            ( (displayMode === 'optimized' || displayMode === 'both') ? '<i style="background: green"></i> Optimized Route<br>' : '') +
+                            '<i style="background: gray; border: 1px solid black; border-style: dashed;"></i> Segment Fetch Failed<br>' + 
+                            '<div style="display:flex; align-items:center; margin-top:3px;"><div class="custom-div-icon" style="position:relative; margin-right:5px;">#</div> Pupil Stop (Numbered)</div>' +
+                            '<div style="display:flex; align-items:center; margin-top:3px;"><div class="custom-div-icon school" style="position:relative; margin-right:5px;">S</div> School Stop</div>';
+                        return div;
+                    };
+                    legend.addTo(map);
+                    legendRef.current = legend; 
+                    if(isMounted) setIsMapLoading(false);
+                };
+                
+                initializeAndDrawMap();
+
+                return () => {
+                    isMounted = false;
+                };
+            }, [show, mapData, routeId, displayMode]); 
+
+            useEffect(() => {
+                if (!show && mapRef.current) {
+                    mapRef.current.remove();
+                    mapRef.current = null;
+                }
+            }, [show]); 
+
+            if (!show) return null;
+
+            return (
+                <div className="map-modal-overlay" onClick={onClose}>
+                    <div className="map-modal-content" onClick={e => e.stopPropagation()}>
+                        <div className="map-modal-header">
+                            <h2 className="map-modal-title">Route Map: {routeId}</h2>
+                            <button onClick={onClose} className="map-modal-close-btn">Close</button>
+                        </div>
+                        <div className="map-modal-controls">
+                            <label><input type="radio" name="routeToggle" value="original" checked={displayMode === 'original'} onChange={() => setDisplayMode('original')} /> Original</label>
+                            <label><input type="radio" name="routeToggle" value="optimized" checked={displayMode === 'optimized'} onChange={() => setDisplayMode('optimized')} /> Optimized</label>
+                            <label><input type="radio" name="routeToggle" value="both" checked={displayMode === 'both'} onChange={() => setDisplayMode('both')} /> Both</label>
+                        </div>
+                        <p className="map-modal-subtitle">Fetching driving directions... This may take a moment and uses more API calls.</p>
+                        <div style={{position: 'relative', flexGrow: 1}}>
+                            <div ref={mapContainerRef} id="map-container"></div>
+                            {isMapLoading && <div className="map-loading-indicator">Loading Map Data...</div>}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function App() { 
+            const [file, setFile] = useState(null);
+            const [rawData, setRawData] = useState([]);
+            const [optimizedSummary, setOptimizedSummary] = useState([]);
+            const [changedRoutesDetails, setChangedRoutesDetails] = useState([]);
+            const [isLoading, setIsLoading] = useState(false);
+            const [loadingMessage, setLoadingMessage] = useState('');
+            const [error, setError] = useState('');
+            const [activeTab, setActiveTab] = useState('summary');
+            const [allOptimizedRowsForDownload, setAllOptimizedRowsForDownload] = useState([]);
+            const [showMapModal, setShowMapModal] = useState(false);
+            const [currentMapData, setCurrentMapData] = useState(null); 
+            const [currentMapRouteId, setCurrentMapRouteId] = useState('');
+            const [allRoutesMapData, setAllRoutesMapData] = useState({}); 
+
+
+            const handleFileUpload = (event) => {
+                const uploadedFile = event.target.files[0];
+                if (uploadedFile && uploadedFile.type === "text/csv") {
+                    setFile(uploadedFile); setError('');
+                } else { setFile(null); setError("Please upload a valid CSV file."); }
+                setOptimizedSummary([]); setChangedRoutesDetails([]); setRawData([]); 
+                setAllOptimizedRowsForDownload([]); setAllRoutesMapData({});
+                routeGeometryCache.clear(); 
+            };
+
+            const handleShowMap = (routeId) => {
+                const mapDataForRoute = allRoutesMapData[routeId];
+                if (mapDataForRoute) {
+                    setCurrentMapData(mapDataForRoute);
+                    setCurrentMapRouteId(routeId);
+                    setShowMapModal(true);
+                } else { setError("Map data not available for this route."); }
+            };
+
+            const processData = useCallback(async () => {
+                if (!file) { setError("No file uploaded."); return; }
+                setIsLoading(true); setLoadingMessage('Initializing...'); setError(''); 
+                setOptimizedSummary([]); setChangedRoutesDetails([]); setAllOptimizedRowsForDownload([]); 
+                setAllRoutesMapData({});
+                routeGeometryCache.clear(); 
+
+                Papa.parse(file, {
+                    header: true, skipEmptyLines: true, dynamicTyping: false, 
+                    transformHeader: header => header.trim(), 
+                    complete: async (results) => {
+                        console.log("[PROCESS DATA] PapaParse complete. Number of rows:", results.data ? results.data.length : 'N/A', "Parse errors:", results.errors);
+                        if (results.errors.length > 0) {
+                            setError(`CSV Parsing Error: ${results.errors[0].message}`);
+                            setIsLoading(false); setLoadingMessage(''); return;
+                        }
+
+                        if (!results.data || results.data.length === 0) {
+                            setError("CSV file contains no data rows after parsing headers (or data is null).");
+                            setIsLoading(false); setLoadingMessage('');
+                            setRawData([]); 
+                            return;
+                        }
+                        
+                        let validationResult;
+                        try {
+                            setLoadingMessage('Validating CSV data...');
+                            validationResult = validateData(results.data); 
+                            
+                            console.log("[PROCESS DATA] Type of validationResult:", typeof validationResult);
+                            try {
+                                console.log("[PROCESS DATA] Content of validationResult (JSON.stringify):", JSON.stringify(validationResult, null, 2));
+                            } catch (e) {
+                                console.error("[PROCESS DATA] Could not stringify validationResult:", e);
+                                console.log("[PROCESS DATA] Content of validationResult (direct):", validationResult);
+                            }
+
+                            if (!validationResult || typeof validationResult.isValid !== 'boolean') {
+                                 setError("CSV validation failed unexpectedly. Check console for details.");
+                                 setLoadingMessage('Validation Error.'); 
+                                 setIsLoading(false); 
+                                 setRawData(results.data); 
+                                 return;
+                            }
+
+                        } catch (validationError) {
+                            setError(`Error during CSV validation: ${validationError.message}`);
+                            setLoadingMessage('Validation Error.'); 
+                            setIsLoading(false); 
+                            setRawData(results.data); 
+                            return;
+                        }
+
+                        if (!validationResult.isValid) {
+                            setError(validationResult.message); 
+                            setLoadingMessage('Validation Failed. See error.'); 
+                            setIsLoading(false); 
+                            setRawData(results.data); 
+                            return; 
+                        }
+                        
+                        setLoadingMessage('Validation OK. Preparing optimization...'); 
+                        setRawData(results.data); 
+                        
+                        try {
+                            const { summary, details, allOptimizedRows, collectedMapData } = await optimizeRoutes(results.data, setLoadingMessage, setError);
+                            setOptimizedSummary(summary);
+                            setChangedRoutesDetails(details);
+                            setAllOptimizedRowsForDownload(allOptimizedRows);
+                            setAllRoutesMapData(collectedMapData); 
+                        } catch (e) {
+                            setError(`Critical Error during optimization: ${e.message}.`);
+                            setIsLoading(false);
+                            setLoadingMessage('');
+                        } finally {
+                            setIsLoading(false); 
+                            setLoadingMessage('');
+                        }
+                    },
+                    error: (err) => { setError(`CSV Parsing Critical Error: ${err.message}`); setIsLoading(false); setLoadingMessage(''); }
+                });
+            }, [file]); 
+
+            const optimizeRoutes = async (data, progressCallback, errorCallbackGlobal) => {
+                progressCallback('Filtering routes...'); 
+                const TARGET_ROUTE_TYPE = "WBK - MW"; 
+                const DEBUG_ROUTE_ID = null; 
+
+                const wbkMwData = data.filter(row => (row['route_type'] && typeof row['route_type'] === 'string') ? row['route_type'].trim().toUpperCase() === TARGET_ROUTE_TYPE.toUpperCase() : false);
+                const otherRoutesData = data.filter(row => (row['route_type'] && typeof row['route_type'] === 'string') ? row['route_type'].trim().toUpperCase() !== TARGET_ROUTE_TYPE.toUpperCase() : true);
+
+                if (wbkMwData.length === 0 && data.length > 0) { 
+                    errorCallbackGlobal(`No routes of type '${TARGET_ROUTE_TYPE}' found to optimize.`);
+                    return { summary: [], details: [], allOptimizedRows: data, collectedMapData: {} };
+                }
+                
+                const summaryResults = []; const detailResults = []; let processedWbkMwRows = [];
+                const collectedMapData = {}; 
+
+                const routes = {};
+                wbkMwData.forEach(row => {
+                    const routeId = row['route']; 
+                    if (!routes[routeId]) routes[routeId] = [];
+                    routes[routeId].push(row);
+                });
+
+                let routeCounter = 0; const totalRoutesToProcess = Object.keys(routes).length;
+
+                for (const routeId in routes) { 
+                    routeCounter++;
+                    const currentRouteLogPrefix = `[OPTIMIZE ROUTE ${routeId} (${routeCounter}/${totalRoutesToProcess})]`;
+                    if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} START PROCESSING`);
+                    progressCallback(`Processing route ${routeId} (${routeCounter}/${totalRoutesToProcess})...`);
+                    
+                    const group = routes[routeId]; if (!group || group.length === 0) continue;
+                    let pointIdCounter = 0; 
+
+                    if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} Step 1: Filtering pupil stops`);
+                    let allPupilStopsInGroup = group.filter(r => parseFloat(r.Seg_No) > 0)
+                        .sort((a, b) => parseFloat(a.Seg_No) - parseFloat(b.Seg_No))
+                        .map((r, index) => ({ 
+                            id: `pupil_${routeId}_${r.Pupil_Id_No || `seg${r.Seg_No}_idx${pointIdCounter++}`}`, 
+                            lat: parseFloat(r.pupil_lat), lon: parseFloat(r.pupil_lon), data: r, type: 'pupil',
+                            label: `Pupil ${r.Pupil_Id_No || 'Unknown'}`, 
+                            sequenceInPath: index + 1 
+                        })).filter(p => !isNaN(p.lat) && !isNaN(p.lon));
+                    if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} Step 1a: Found ${allPupilStopsInGroup.length} pupil stops`);
+
+                    if (allPupilStopsInGroup.length === 0) {
+                        if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} No pupil stops, skipping.`);
+                        summaryResults.push({ routeId, originalDuration: "Error (No Pupils)", optimizedDuration: "Error", savedMinutes: "N/A", pupilOrderChanged: false });
+                        processedWbkMwRows.push(...group.filter(r => parseFloat(r.Seg_No) === 0)); continue;
+                    }
+                    
+                    const firstOriginalPupilPoint = allPupilStopsInGroup[0];
+                    const otherOriginalPupilObjects = allPupilStopsInGroup.slice(1);
+                    if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} Step 1b: First pupil ID: ${firstOriginalPupilPoint.id}, Other pupils: ${otherOriginalPupilObjects.length}`);
+                    
+                    if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} Step 2: Filtering school stops`);
+                    const schoolStopObjects = group.filter(r => parseFloat(r.Seg_No) === 0 && String(r['School_Code_&_Name']).trim() === '0')
+                        .sort((a,b) => String(a['Sess_Beg.']).localeCompare(String(b['Sess_Beg.']))) 
+                        .map((r, index) => ({ 
+                            id: `school_${routeId}_${r['School_Code_&_Name']}_${String(r['Sess_Beg.']).replace(/[^a-zA-Z0-9]/g, "")}_idx${pointIdCounter++}`, 
+                            lat: parseFloat(r.school_lat), lon: parseFloat(r.school_lon), data: r, type: 'school',
+                            label: `School (Sess. ${r['Sess_Beg.']})`,
+                            sequenceInPath: allPupilStopsInGroup.length + index + 1 
+                        })).filter(s => !isNaN(s.lat) && !isNaN(s.lon));
+                    
+                    if (routeId === DEBUG_ROUTE_ID || routeId === 'K502') { 
+                        console.log(`${currentRouteLogPrefix} Step 2a: Found ${schoolStopObjects.length} school stops after filtering. School objects:`, JSON.parse(JSON.stringify(schoolStopObjects)));
+                    }
+                    
+                    let uniquePointsForMatrix = [...allPupilStopsInGroup, ...schoolStopObjects] 
+                        .filter(p => p && typeof p.lat === 'number' && !isNaN(p.lat) && typeof p.lon === 'number' && !isNaN(p.lon)); 
+                    
+                    const tempPointIds = new Set();
+                    const finalUniquePointsForMatrix = uniquePointsForMatrix.filter(p => {
+                        if(!p || !p.id) return false; 
+                        if (tempPointIds.has(p.id)) return false;
+                        tempPointIds.add(p.id); return true;
+                    });
+                    if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} Step 3: Final unique points for OSRM: ${finalUniquePointsForMatrix.length}`);
+
+
+                    if (finalUniquePointsForMatrix.length < 2 && !(allPupilStopsInGroup.length === 0 && schoolStopObjects.length > 0) ) {
+                         if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} Not enough points for OSRM, skipping.`);
+                         summaryResults.push({ routeId, originalDuration: "Error (Few Points)", optimizedDuration: "Error", savedMinutes: "N/A", pupilOrderChanged: false });
+                         allPupilStopsInGroup.forEach(p => processedWbkMwRows.push(p.data));
+                         schoolStopObjects.forEach(s => processedWbkMwRows.push(s.data)); continue;
+                    }
+                    
+                    if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} Step 4: Preparing original map path coordinates`);
+                    const originalMapPathCoords = [...allPupilStopsInGroup, ...schoolStopObjects]
+                        .filter(p => typeof p.lat === 'number' && !isNaN(p.lat) && typeof p.lon === 'number' && !isNaN(p.lon));
+
+                    if (routeId === DEBUG_ROUTE_ID || routeId === 'K502') {
+                        console.log(`${currentRouteLogPrefix} Original Map Path Coords for map construction:`, JSON.parse(JSON.stringify(originalMapPathCoords)));
+                    }
+
+                    if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} Step 5: Calling getOSRMMatrix`);
+                    const osrmFullMatrixData = await getOSRMMatrix(finalUniquePointsForMatrix, routeId);
+                    if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} Step 6: Returned from getOSRMMatrix. Error: ${osrmFullMatrixData.error}`);
+
+                    if (osrmFullMatrixData.error) {
+                        errorCallbackGlobal(`OSRM Error for route ${routeId}: ${osrmFullMatrixData.error}.`);
+                        summaryResults.push({ routeId, originalDuration: "Error (OSRM)", optimizedDuration: "Error", savedMinutes: "N/A", pupilOrderChanged: false });
+                        processedWbkMwRows.push(...group); continue;
+                    }
+                     if (!osrmFullMatrixData.map || osrmFullMatrixData.durations.length === 0 && finalUniquePointsForMatrix.length >=2 ) {
+                         summaryResults.push({ routeId, originalDuration: "Error (OSRM Empty)", optimizedDuration: "Error", savedMinutes: "N/A", pupilOrderChanged: false });
+                         processedWbkMwRows.push(...group); continue;
+                    }
+
+                    if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} Step 7: Calculating original path duration`);
+                    const originalPathPointIds = originalMapPathCoords.map(p => p.id).filter(id => osrmFullMatrixData.map.has(id));
+                    const originalTotalDuration = calculatePathMetricFromMatrix(originalPathPointIds, osrmFullMatrixData, 'durations');
+                    if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} Step 7a: Original duration: ${originalTotalDuration}`);
+
+                    const firstSchoolForOpt = schoolStopObjects.length > 0 ? schoolStopObjects[0] : null;
+                    let optimizedOtherPupilObjects = [...otherOriginalPupilObjects]; 
+
+                    if (otherOriginalPupilObjects.length > 0) { 
+                        if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} Step 8: Calling 2-opt solver`);
+                        const { optimizedOrder } = twoOptSolverOSRM(firstOriginalPupilPoint.id, otherOriginalPupilObjects, osrmFullMatrixData, firstSchoolForOpt ? firstSchoolForOpt.id : null);
+                        optimizedOtherPupilObjects = optimizedOrder;
+                        if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} Step 8a: 2-opt solver finished`);
+                    }
+                    
+                    if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} Step 9: Calculating optimized path duration`);
+                    const fullOptimizedPupilList = [firstOriginalPupilPoint, ...optimizedOtherPupilObjects];
+                    const optimizedPupilsWithSeq = fullOptimizedPupilList.map((p, index) => ({
+                        ...p,
+                        sequenceInPath: index + 1
+                    }));
+
+                    const optimizedMapPathCoords = [...optimizedPupilsWithSeq, ...schoolStopObjects.map((s, index) => ({...s, sequenceInPath: optimizedPupilsWithSeq.length + index + 1}))]
+                        .filter(p => typeof p.lat === 'number' && !isNaN(p.lat) && typeof p.lon === 'number' && !isNaN(p.lon));
+                    
+                     if (routeId === DEBUG_ROUTE_ID || routeId === 'K502') {
+                        console.log(`${currentRouteLogPrefix} Optimized Map Path Coords for map construction:`, JSON.parse(JSON.stringify(optimizedMapPathCoords)));
+                    }
+                    
+                    const optimizedPathPointIdsForMetric = optimizedMapPathCoords.map(p => p.id).filter(id => osrmFullMatrixData.map.has(id));
+                    const optimizedTotalDuration = calculatePathMetricFromMatrix(optimizedPathPointIdsForMetric, osrmFullMatrixData, 'durations');
+                    if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} Step 9a: Optimized duration: ${optimizedTotalDuration}`);
+                    
+                    collectedMapData[routeId] = { originalPathCoords: originalMapPathCoords, optimizedPathCoords: optimizedMapPathCoords };
+
+                    const pupilOrderChanged = JSON.stringify(otherOriginalPupilObjects.map(p=>p.id)) !== JSON.stringify(optimizedOtherPupilObjects.map(p=>p.id)) && otherOriginalPupilObjects.length > 0;
+                    const durationSaved = originalTotalDuration - optimizedTotalDuration;
+
+                    summaryResults.push({ routeId, originalDuration: originalTotalDuration === Infinity ? "Error" : (originalTotalDuration / 60).toFixed(1), optimizedDuration: optimizedTotalDuration === Infinity ? "Error" : (optimizedTotalDuration / 60).toFixed(1), savedMinutes: (isNaN(durationSaved) || originalTotalDuration === Infinity || optimizedTotalDuration === Infinity) ? "N/A" : (durationSaved / 60).toFixed(1), pupilOrderChanged });
+                    if (pupilOrderChanged || (durationSaved > 1 && !isNaN(durationSaved) && originalTotalDuration !== Infinity && optimizedTotalDuration !== Infinity )) {
+                        detailResults.push({ routeId, originalDuration: (originalTotalDuration / 60).toFixed(1), optimizedDuration: (optimizedTotalDuration / 60).toFixed(1), durationSaved: (durationSaved / 60).toFixed(1), originalPupilOrder: originalMapPathCoords.filter(p=>p.type==='pupil').map(p => `ID: ${p.data.Pupil_Id_No || 'N/A'} (Orig.Seg: ${p.data.Seg_No})`).join(' -> '), optimizedPupilOrder: optimizedMapPathCoords.filter(p=>p.type==='pupil').map(p => `ID: ${p.data.Pupil_Id_No || 'N/A'} (Orig.Seg: ${p.data.Seg_No})`).join(' -> ') });
+                    }
+                    
+                    optimizedPupilsWithSeq.forEach((pupilPointObj, index) => { 
+                        processedWbkMwRows.push({ ...pupilPointObj.data, Seg_No: index + 1 }); 
+                    });
+                    schoolStopObjects.forEach(schoolPointObj => { 
+                        processedWbkMwRows.push(schoolPointObj.data); 
+                    });
+                    if (routeId === DEBUG_ROUTE_ID) console.log(`${currentRouteLogPrefix} END OF PROCESSING FOR ROUTE`);
+                }
+                return { summary: summaryResults, details: detailResults, allOptimizedRows: [...otherRoutesData, ...processedWbkMwRows], collectedMapData };
+            };
+            
+            const downloadOptimizedCSV = () => { 
+                if (allOptimizedRowsForDownload.length === 0) {
+                    setError("No optimized data to download. Please process a file first.");
+                    return;
+                }
+                const headers = rawData.length > 0 ? Object.keys(rawData[0]) : (allOptimizedRowsForDownload.length > 0 ? Object.keys(allOptimizedRowsForDownload[0]) : []);
+                if (headers.length === 0) {
+                    setError("Cannot determine headers for CSV.");
+                    return;
+                }
+                const csv = Papa.unparse({
+                    fields: headers, 
+                    data: allOptimizedRowsForDownload.map(row => {
+                        const completeRow = {};
+                        headers.forEach(header => {
+                            completeRow[header] = row.hasOwnProperty(header) ? row[header] : "";
+                        });
+                        return completeRow;
+                    })
+                });
+                const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                const link = document.createElement("a");
+                const url = URL.createObjectURL(blob);
+                link.setAttribute("href", url);
+                link.setAttribute("download", "optimized_bus_routes_osrm.csv");
+                link.style.visibility = 'hidden';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+             };
+
+            return ( 
+                <div className="bg-white p-6 sm:p-8 rounded-xl shadow-2xl space-y-6 min-w-full">
+                    <header className="text-center">
+                        <h1 className="text-3xl sm:text-4xl font-bold text-gray-800">School Bus Route Optimizer (OSRM)</h1>
+                        <p className="text-gray-600 mt-2">Upload CSV to optimize routes using OSRM. Results are in minutes.</p>
+                         <p className="text-xs text-orange-600 mt-1">
+                            Uses public OSRM demo server: For testing only. Subject to rate limits & availability.
+                            Max ~100 stops per route for OSRM table service.
+                        </p>
+                    </header>
+
+                    {error && <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-lg my-4" role="alert">{error}</div>}
+
+                    <section className="bg-gray-50 p-6 rounded-lg shadow">
+                         <div className="flex flex-col sm:flex-row sm:items-center sm:space-x-4 space-y-4 sm:space-y-0">
+                            <div className="flex-grow">
+                                <label htmlFor="file-upload" className="block text-sm font-medium text-gray-700 mb-1">Upload CSV File</label>
+                                <input id="file-upload" type="file" accept=".csv" onChange={handleFileUpload}
+                                    className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 cursor-pointer border border-gray-300 rounded-lg"/>
+                            </div>
+                            <button onClick={processData} disabled={!file || isLoading}
+                                className="w-full sm:w-auto px-6 py-3 bg-blue-600 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 disabled:opacity-50 disabled:cursor-not-allowed transition duration-150 ease-in-out">
+                                {isLoading ? (loadingMessage || 'Processing...') : 'Optimize Routes (OSRM)'}
+                            </button>
+                        </div>
+                    </section>
+
+                    {isLoading && ( 
+                        <div className="text-center my-4">
+                            <div className="loader"></div>
+                            <p className="text-blue-600 pulsing-loader">{loadingMessage || 'Processing...'}</p>
+                        </div>
+                    )}
+                    
+                    <MapModal 
+                        show={showMapModal} 
+                        onClose={() => setShowMapModal(false)} 
+                        mapData={currentMapData}
+                        routeId={currentMapRouteId}
+                    />
+
+                    {(rawData.length > 0 && !isLoading) && (
+                        <section className="mt-8">
+                            <div className="flex flex-col sm:flex-row justify-between items-center mb-4 space-y-2 sm:space-y-0">
+                                <div className="flex border-b border-gray-300">
+                                    <button onClick={() => setActiveTab('summary')}
+                                        className={`py-2 px-4 -mb-px font-medium text-sm ${activeTab === 'summary' ? 'border-b-2 border-blue-500 text-blue-600' : 'text-gray-500 hover:text-gray-700'}`}>
+                                        Summary (Durations in Minutes)
+                                    </button>
+                                    <button onClick={() => setActiveTab('details')}
+                                        className={`py-2 px-4 -mb-px font-medium text-sm ${activeTab === 'details' ? 'border-b-2 border-blue-500 text-blue-600' : 'text-gray-500 hover:text-gray-700'}`}>
+                                        Changed Route Details
+                                    </button>
+                                </div>
+                                <button onClick={downloadOptimizedCSV}
+                                    disabled={allOptimizedRowsForDownload.length === 0}
+                                    className="px-4 py-2 bg-green-600 text-white font-semibold rounded-lg shadow-md hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-opacity-50 disabled:opacity-50 disabled:cursor-not-allowed transition duration-150 ease-in-out">
+                                    Download Optimized CSV
+                                </button>
+                            </div>
+
+                            {activeTab === 'summary' && (
+                                <div className="bg-white p-4 sm:p-6 rounded-lg shadow-md overflow-x-auto">
+                                    <h2 className="text-xl font-semibold text-gray-700 mb-4">Optimization Summary (Durations in Minutes)</h2>
+                                    {optimizedSummary.length > 0 ? (
+                                        <table className="min-w-full divide-y divide-gray-200 table-fixed-layout">
+                                            <thead className="bg-gray-50">
+                                                <tr>
+                                                    <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-1/6">Route ID</th>
+                                                    <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-1/6">Original Duration (min)</th>
+                                                    <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-1/6">Optimized Duration (min)</th>
+                                                    <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-1/6">Saved (min)</th>
+                                                    <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-1/6">Pupil Order Changed?</th>
+                                                    <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-1/6">Map</th> 
+                                                </tr>
+                                            </thead>
+                                            <tbody className="bg-white divide-y divide-gray-200">
+                                                {optimizedSummary.map((item, index) => (
+                                                    <tr key={item.routeId || index} className={`${item.originalDuration?.toString().startsWith("Error") ? "bg-red-50" : (item.pupilOrderChanged ? "bg-yellow-50" : "")}`}>
+                                                        <td className="px-3 py-3 whitespace-nowrap text-sm text-gray-700">{item.routeId}</td>
+                                                        <td className="px-3 py-3 whitespace-nowrap text-sm text-gray-700">{item.originalDuration}</td>
+                                                        <td className="px-3 py-3 whitespace-nowrap text-sm text-gray-700">{item.optimizedDuration}</td>
+                                                        <td className={`px-3 py-3 whitespace-nowrap text-sm ${parseFloat(item.savedMinutes) > 0 ? 'text-green-600 font-semibold' : 'text-gray-700'}`}>{item.savedMinutes}</td>
+                                                        <td className="px-3 py-3 whitespace-nowrap text-sm text-gray-700">{item.pupilOrderChanged ? 'Yes' : 'No'}</td>
+                                                        <td className="px-3 py-3 whitespace-nowrap text-sm text-blue-600 hover:text-blue-800">
+                                                            {allRoutesMapData[item.routeId] && (allRoutesMapData[item.routeId].originalPathCoords.length > 0 || allRoutesMapData[item.routeId].optimizedPathCoords.length > 0) ? (
+                                                                <button onClick={() => handleShowMap(item.routeId)} className="underline cursor-pointer">View Map</button>
+                                                            ) : (
+                                                                <span className="text-gray-400">N/A</span>
+                                                            )}
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    ) : ( rawData.length > 0 && !isLoading && <p className="text-gray-600">No routes were optimized. Check console for details.</p>)}
+                                </div>
+                            )}
+
+                            {activeTab === 'details' && ( 
+                                 <div className="bg-white p-4 sm:p-6 rounded-lg shadow-md mt-6 overflow-x-auto">
+                                    <h2 className="text-xl font-semibold text-gray-700 mb-4">Changed Route Details (Durations in Minutes)</h2>
+                                    {changedRoutesDetails.length > 0 ? (
+                                        <div className="space-y-6">
+                                            {changedRoutesDetails.map((item, index) => (
+                                                <details key={item.routeId || index} className="bg-gray-50 p-4 rounded-lg shadow-sm">
+                                                    <summary className="font-semibold text-blue-600 cursor-pointer hover:text-blue-800">
+                                                        Route ID: {item.routeId} (Saved: {item.durationSaved} min)
+                                                    </summary>
+                                                    <div className="mt-3 space-y-2 text-sm">
+                                                        <p><strong>Original Duration:</strong> {item.originalDuration} min</p>
+                                                        <p><strong>Optimized Duration:</strong> {item.optimizedDuration} min</p>
+                                                        <div>
+                                                            <p className="font-medium mt-2">Original Pupil Order:</p>
+                                                            <p className="text-gray-600 break-all">{item.originalPupilOrder || "N/A"}</p>
+                                                        </div>
+                                                        <div>
+                                                            <p className="font-medium mt-2">Optimized Pupil Order:</p>
+                                                            <p className="text-gray-600 break-all">{item.optimizedPupilOrder || "N/A"}</p>
+                                                        </div>
+                                                    </div>
+                                                </details>
+                                            ))}
+                                        </div>
+                                     ) : ( rawData.length > 0 && !isLoading && <p className="text-gray-600">No routes had significant changes to detail (after processing).</p>)}
+                                </div>
+                            )}
+                        </section>
+                    )}
+                </div>
+            );
+        }
+
+        const container = document.getElementById('root');
+        const root = ReactDOM.createRoot(container);
+        root.render(<App />);
+    </script>
+</body>
+</html>
+
